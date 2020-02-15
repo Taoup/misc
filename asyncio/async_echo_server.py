@@ -4,53 +4,43 @@ from collections import deque
 
 class BaseEvent:
 
-    def do_schedule(self, scheduler, task):
-        raise NotImplemented
-
-    def happen_so_smooth(self, scheduler, task):
-        raise NotImplemented
-
-
-class ConnectEvent(BaseEvent):
-
     def __init__(self, sock):
         self.sock = sock
 
-    def do_schedule(self, scheduler, task):
-        scheduler.waiting_for_read(self.sock.fileno(), self, task)
+    def fileno(self):
+        return self.sock.fileno()
 
-    def happen_so_smooth(self, scheduler, task):
+    def happen(self):
+        raise NotImplemented
+
+class InputEvent(BaseEvent):
+    pass
+
+class ConnectEvent(InputEvent):
+
+    def happen(self):
         res = self.sock.accept()
-        scheduler.add_ready(task, res)
+        return res
 
-
-class ReceiveEvent(BaseEvent):
+class ReceiveEvent(InputEvent):
 
     def __init__(self, sock, nbytes):
         self.nbytes = nbytes
-        self.sock = sock
+        super().__init__(sock)
 
-    def do_schedule(self, scheduler, task):
-        scheduler.waiting_for_read(self.sock.fileno(), self, task)
-
-    def happen_so_smooth(self, scheduler, task):
+    def happen(self):
         res = self.sock.recv(self.nbytes)
-        scheduler.add_ready(task, res)
+        return res
 
-
-class SendEvent(BaseEvent):
+class OutputEvent(BaseEvent):
     
     def __init__(self, sock, data):
         self.data = data
-        self.sock = sock
+        super().__init__(sock)
 
-    def do_schedule(self, scheduler, task):
-        scheduler.waiting_for_write(self.sock.fileno(), self, task)
-
-    def happen_so_smooth(self, scheduler, task):
+    def happen(self):
         nbytes = self.sock.send(self.data)
-        scheduler.add_ready(task, nbytes)
-
+        return nbytes
 
 class Socket:
     
@@ -67,17 +57,17 @@ class Socket:
         return ReceiveEvent(self.sock, nbytes)
 
     def send(self, data):
-        return SendEvent(self.sock, data)
+        return OutputEvent(self.sock, data)
 
 def echo_server(addr, scheduler):
     """
     addr: a tuple consisting of (ip, port) for this server
         to listen on
-    scheduler: when a client connection comes in, schedule the client handler
+    scheduler: when a client connection comes in, schedule the client task
         ro run.
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    # set this socket as a reusable socket, a typical for server socket
+    # Set this socket as a reusable socket. Typical for server socket
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
     sock.bind(addr)
     sock.listen(5)
@@ -130,8 +120,8 @@ class Scheduler:
     def __init__(self):
         self._nrunning_tasks = 0
         self._readyq = deque()
-        self._read_waiting = {}
-        self._write_waiting = {}
+        self._read_wait = {}
+        self._write_wait = {}
     
     def submit_task(self, task):
         """
@@ -145,43 +135,36 @@ class Scheduler:
         self._readyq.append((task, None))
         self._nrunning_tasks += 1
     
-    def add_ready(self, task, data):
-        self._readyq.append((task, data))
-
-    def waiting_for_read(self, fileno, event, task):
-        self._read_waiting[fileno] = (event, task)
-
-    def waiting_for_write(self, fileno, event, task):
-        self._write_waiting[fileno] = (event, task)
-
     def run(self):
         while self._nrunning_tasks:
-            if self._readyq:
-                self._run()
+            self._execute()
             # This is the core of whole asynchronous thing!
-            rset, wset, eset = select.select(self._read_waiting, self._write_waiting, [])
+            rset, wset, eset = select.select(self._read_wait, self._write_wait, [])
             for i, fileno in enumerate(rset+wset):
-                which = (self._read_waiting, self._write_waiting)[i>=len(rset)]
-                # At this moment, we are sure the event will happen without blocking!
+                which = (self._read_wait, self._write_wait)[i>=len(rset)]
                 event, task = which.pop(fileno)
-                event.happen_so_smooth(self, task)
+                # At this moment, we are sure the event will happen without blocking!
+                res = event.happen()
+                self._readyq.append((task, res))
 
-    
-    def _run(self):
+    def _execute(self):
         while self._readyq:
             task, data = self._readyq.popleft()
             try:
                 # move the current task to next steps, till another event
                 # is yielded by the task.
                 event = task.send(data)
-                if isinstance(event, BaseEvent):
-                    # do event specific scheduling by passing the scheduler in
-                    event.do_schedule(self, task)
-                else:
-                    raise RuntimeError(f"Unkown event type: {event.__class__}")
             except StopIteration:
                 self._nrunning_tasks -= 1
+            else:
+                self._schedule(event, task)
 
+    def _schedule(self, event, task):
+        if isinstance(event, (InputEvent, OutputEvent)):
+            queue = [self._write_wait, self._read_wait][isinstance(event, InputEvent)]
+            queue[event.fileno()] = (event, task)
+        else:
+            raise RuntimeError(f"Unkown event type: {event.__class__}")
 
 if __name__ == '__main__':
 
